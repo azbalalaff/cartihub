@@ -7176,6 +7176,15 @@ function CartiHubEndFakeTradeSession()
     _G.CartiHubActiveFakeTradeUsername = nil
     _G.CartiHubInstantFakeTradeReturnPending = false
 
+    -- Remove temporary fake inventory amounts added for their offer visuals
+    for _, offer in ipairs(theirOffer or {}) do
+        local current = CartiHubGetFakeInventoryAmount(offer.ItemID, offer.ItemType)
+        if current > 0 then
+            CartiHubSetFakeInventoryAmount(offer.ItemID, offer.ItemType,
+                math.max(0, current - (offer.Amount or 1)))
+        end
+    end
+
     if CartiHubDisconnectFakeTradeFrameGuardSignals then
         CartiHubDisconnectFakeTradeFrameGuardSignals()
     end
@@ -7373,12 +7382,42 @@ local function drawOfferSlots(offerFrame, offerList)
 
         local itemData = copyItemData(offer.ItemID, offer.ItemType, offer.Amount)
         if slot and itemData then
+            -- Ensure image is populated for chroma overrides and standard items
+            if not itemData.Image or itemData.Image == "" or itemData.Image == 0 then
+                local overrideName = itemData.ItemName or itemData.Name or offer.ItemID
+                itemData.Image = SpawnerImageOverrides[offer.ItemID]
+                    or SpawnerImageOverrides[overrideName]
+                    or itemData.Image
+            end
+            -- Convert numeric image IDs to rbxassetid string for DisplayItem
+            if type(itemData.Image) == "number" and itemData.Image > 0 then
+                itemData.Image = "rbxassetid://" .. tostring(itemData.Image)
+            end
             CartiHubClearSeasonalOfferTagGuards(slot)
             itemModule.DisplayItem(slot, itemData)
             if offer.HideSeasonalTags then
                 CartiHubHideSeasonalOfferTags(slot)
             end
             slot.Visible = true
+            -- Apply weapon visual cosmetic to the slot thumbnail if available
+            task.defer(function()
+                if not slot.Parent then return end
+                local entry = Runtime.Visual.Entries[offer.ItemID]
+                    or Runtime.Visual.Catalog[offer.ItemID]
+                if not entry then return end
+                -- Find the item image label inside the slot and force the thumbnail
+                local thumb = slot:FindFirstChildWhichIsA("ImageLabel", true)
+                    or slot:FindFirstChildWhichIsA("ImageButton", true)
+                if thumb then
+                    local img = SpawnerImageOverrides[offer.ItemID]
+                        or SpawnerImageOverrides[itemData.ItemName or itemData.Name or ""]
+                    if img and img ~= "" then
+                        thumb.Image = img
+                    elseif type(itemData.Image) == "string" and itemData.Image ~= "" then
+                        thumb.Image = itemData.Image
+                    end
+                end
+            end)
         end
     end
 end
@@ -7878,6 +7917,12 @@ redrawLocalTrade = function()
     tradeModule.GUI.TheirOffer.Username.Text = "(" .. getFakeTradeSenderName() .. ")"
     CartiHubApplyPendingFakeTradeUsername()
     installOfferRemoveButtons()
+    -- Re-apply visuals after a short delay to let DisplayItem finish rendering
+    task.delay(0.1, function()
+        if not _G.CartiHubFakeTradeActive then return end
+        drawOfferSlots(tradeModule.GUI.YourOffer, localOffer)
+        drawOfferSlots(tradeModule.GUI.TheirOffer, theirOffer)
+    end)
 end
 
 local function toggleLocalOffer(itemId, itemType)
@@ -8118,7 +8163,7 @@ local function addItemToTheirOfferStack(itemId, itemType, amount, hideSeasonalTa
         end
     end
 
-    if #theirOffer >= 4 then
+        if #theirOffer >= 4 then
         return false
     end
 
@@ -8129,6 +8174,14 @@ local function addItemToTheirOfferStack(itemId, itemType, amount, hideSeasonalTa
         StackKey = stackKey,
         HideSeasonalTags = hideSeasonalTags == true,
     })
+
+    -- Add to fake inventory temporarily so visual renderer can track and show it
+    CartiHubAddFakeInventoryAmount(itemId, itemType, amount)
+    task.defer(function()
+        if _G.CartiHubFakeTradeActive then
+            Runtime.Visual.apply(itemId)
+        end
+    end)
 
     return true
 end
