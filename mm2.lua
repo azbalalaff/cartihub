@@ -7226,6 +7226,184 @@ task.spawn(function()
     end
 end)
 
+-- BEGIN REAL TRADE VISUAL PATCH
+-- Applies weapon skin visuals to real trade offer slots so equipped skins
+-- are visible on items shown in both your offer and the other player's offer.
+do
+    local function getTradeSlotItems(offerFrame)
+        local items = {}
+        if not offerFrame then return items end
+        local container = offerFrame:FindFirstChild("Container")
+        if not container then return items end
+        for i = 1, 4 do
+            local slot = container:FindFirstChild("NewItem" .. i)
+            if slot and slot.Visible then
+                -- MM2 stores the item id as an attribute or StringValue on the slot
+                local itemId = slot:GetAttribute("ItemID")
+                    or slot:GetAttribute("ItemId")
+                    or slot:GetAttribute("itemId")
+                local itemType = slot:GetAttribute("ItemType")
+                    or slot:GetAttribute("itemType")
+                    or "Weapons"
+                -- Fallback: check for a child StringValue named ItemID
+                if not itemId then
+                    local val = slot:FindFirstChild("ItemID") or slot:FindFirstChild("ItemId")
+                    if val and val:IsA("StringValue") then
+                        itemId = val.Value
+                    end
+                end
+                -- Fallback: read from tradeModule inventory data
+                if not itemId and tradeModule.TradeInventory and tradeModule.TradeInventory.Data then
+                    for iType, typeData in pairs(tradeModule.TradeInventory.Data) do
+                        for iId, entry in pairs(typeData.Current or {}) do
+                            if entry.Frame == slot or entry.Frame == slot.Parent then
+                                itemId = iId
+                                itemType = iType
+                                break
+                            end
+                        end
+                        if itemId then break end
+                    end
+                end
+                if itemId then
+                    table.insert(items, { ItemID = itemId, ItemType = itemType, Slot = slot })
+                end
+            end
+        end
+        return items
+    end
+
+    local function applyVisualsToRealTradeSlots()
+        if _G.CartiHubFakeTradeActive then return end
+        local gui = tradeModule.GUI
+        local tradeGui = gui and gui.TradeGUI
+        if not tradeGui or not tradeGui.Enabled then return end
+
+        -- Apply visuals for YOUR equipped weapons shown in your offer
+        for _, itemId in ipairs(getLocalEquippedWeaponIds and getLocalEquippedWeaponIds() or {}) do
+            pcall(function()
+                Runtime.Visual.apply(itemId)
+            end)
+        end
+
+        -- Enrich thumbnails in both offer panels
+        for _, offerName in ipairs({ "YourOffer", "TheirOffer" }) do
+            local offerFrame = gui[offerName]
+            local container = offerFrame and offerFrame:FindFirstChild("Container")
+            if container then
+                for i = 1, 4 do
+                    local slot = container:FindFirstChild("NewItem" .. i)
+                    if slot and slot.Visible then
+                        -- Find the image label and ensure it has a valid thumbnail
+                        local imgLabel = slot:FindFirstChildWhichIsA("ImageLabel", true)
+                        if imgLabel and (imgLabel.Image == "" or imgLabel.Image == "rbxassetid://0") then
+                            -- Try to pull itemId from slot attributes for override
+                            local itemId = slot:GetAttribute("ItemID") or slot:GetAttribute("ItemId")
+                            if itemId then
+                                local override = SpawnerImageOverrides[itemId]
+                                if override and override ~= "" then
+                                    imgLabel.Image = override
+                                else
+                                    local data = Runtime.Visual.data(itemId)
+                                    if data and type(data.Image) == "number" and data.Image > 0 then
+                                        imgLabel.Image = "rbxassetid://" .. tostring(data.Image)
+                                    elseif data and type(data.Image) == "string" and data.Image ~= "" then
+                                        imgLabel.Image = data.Image
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    local realTradeConnections = {}
+
+    local function disconnectRealTradeWatchers()
+        for _, conn in ipairs(realTradeConnections) do
+            pcall(function() conn:Disconnect() end)
+        end
+        table.clear(realTradeConnections)
+    end
+
+    local function watchRealTradeSlots()
+        if _G.CartiHubFakeTradeActive then return end
+        disconnectRealTradeWatchers()
+        local gui = tradeModule.GUI
+        local tradeGui = gui and gui.TradeGUI
+        if not tradeGui then return end
+
+        -- Watch for slot visibility changes in both offer panels
+        for _, offerName in ipairs({ "YourOffer", "TheirOffer" }) do
+            local offerFrame = gui[offerName]
+            local container = offerFrame and offerFrame:FindFirstChild("Container")
+            if container then
+                for i = 1, 4 do
+                    local slot = container:FindFirstChild("NewItem" .. i)
+                    if slot then
+                        table.insert(realTradeConnections, Runtime.connect(
+                            slot:GetPropertyChangedSignal("Visible"),
+                            function()
+                                if slot.Visible and not _G.CartiHubFakeTradeActive then
+                                    task.defer(applyVisualsToRealTradeSlots)
+                                end
+                            end
+                        ))
+                        -- Also watch for child image label changes (when DisplayItem sets the image)
+                        table.insert(realTradeConnections, Runtime.connect(
+                            slot.DescendantAdded,
+                            function()
+                                if not _G.CartiHubFakeTradeActive then
+                                    task.defer(applyVisualsToRealTradeSlots)
+                                end
+                            end
+                        ))
+                    end
+                end
+            end
+        end
+    end
+
+    -- Hook TradeGUI.Enabled to detect real trade opening
+    local gui = tradeModule.GUI
+    local tradeGui = gui and gui.TradeGUI
+    if tradeGui then
+        Runtime.connect(tradeGui:GetPropertyChangedSignal("Enabled"), function()
+            if tradeGui.Enabled and not _G.CartiHubFakeTradeActive then
+                -- Real trade opened
+                task.defer(function()
+                    watchRealTradeSlots()
+                    applyVisualsToRealTradeSlots()
+                    -- Re-apply a few times as items load in
+                    for _, delay in ipairs({ 0.3, 0.7, 1.5 }) do
+                        task.delay(delay, function()
+                            if tradeGui.Enabled and not _G.CartiHubFakeTradeActive then
+                                applyVisualsToRealTradeSlots()
+                            end
+                        end)
+                    end
+                end)
+            elseif not tradeGui.Enabled then
+                disconnectRealTradeWatchers()
+            end
+        end)
+    end
+
+    -- Also run on character/tool changes so equipped weapon visuals stay current
+    Runtime.connect(localPlayer.CharacterAdded, function()
+        task.delay(0.5, function()
+            if not _G.CartiHubFakeTradeActive then
+                applyVisualsToRealTradeSlots()
+            end
+        end)
+    end)
+
+    Runtime.cleanup(disconnectRealTradeWatchers)
+end
+-- END REAL TRADE VISUAL PATCH
+
 local function clearOfferSlots(offerFrame)
     if not offerFrame or not offerFrame:FindFirstChild("Container") then
         return
